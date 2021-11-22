@@ -1,0 +1,106 @@
+#!/bin/bash
+
+# Source http://andreyex.narod.ru/recovering.htm
+usage ()
+{
+	echo "This script can create HPA recovery partition on HDD, with Gigabyte motherboard BIOS firmware inside."
+	echo "Useful when Gigabyte motherboard trying to recover BIOS firmware with label \"Scanning BIOS Image in Hard Drive...\""
+	echo
+	echo "Usage build_gigabyte_hpa <path\to\bios\> <path\to\dev>"
+}
+
+if [ -z $1 ] || [ -z $2 ];
+then
+	usage
+	exit 1
+fi
+
+if ! [ -f $1 ];
+then
+	echo "File $1 doesnt exists"
+	exit 2
+fi
+BIOS=$1
+BIOS_SIZE=$(stat --printf="%s" $BIOS)
+
+if ! [ -e $2 ];
+then
+	echo "Block dev $2 doesnt exists"
+	exit 2
+fi
+DEV=$2
+SECTORS=$(fdisk -l -u /dev/sdb | grep '/dev' | head -1 |  grep -o '[[:digit:]]*' | tail -1)
+SECTOR_SIZE=$(fdisk -l -u /dev/sdb | egrep -o '[[:digit:]]{3,4}.*/ [[:digit:]]{3,4}' | head -n1 | egrep -o '[[:digit:]]{3,4}' | head -n1)
+
+HPA=./hpa.img
+HPA_SIZE=$(expr $BIOS_SIZE / $SECTOR_SIZE + 1)
+let "HPA_START=$SECTORS - $HPA_SIZE"
+let "HPA_LAST=($HPA_SIZE - 1) * $SECTOR_SIZE"
+
+while true
+do
+	echo "All data on $DEV may be destroyed are you sure? (y/n)"
+	read SURE
+	if [ -z $SURE ];
+	then
+		continue;
+	fi
+
+	if [ $SURE = 'y' ];
+	then
+		break;
+	fi
+
+	if [ $SURE = 'n' ];
+	then
+		exit;
+	fi
+done
+
+echo "Create HPA image."
+
+#For 2MB bios image (+1 sector)
+dd if=/dev/zero of=$HPA bs=$SECTOR_SIZE count=$HPA_SIZE status=none
+
+echo "Write firmware."
+dd if=$BIOS of=$HPA conv=notrunc status=none
+
+echo "Write header."
+echo 2447414652104140 | xxd -p -r -s 0x$(printf '%x\n' $HPA_LAST) - $HPA #Where last two bytes size of bios flash (08 - 2048 kbit) maybe 40 its 2Mbyte, maybe its not important
+
+echo "Write image address."
+printf "%x\n" $HPA_START | xxd -p -r | xxd -e | xxd -p -r -s 0x$(printf '%x\n' $(expr $HPA_LAST + 22) ) - $HPA #When $HPA_START % 2 = 1 last byte will be truncated
+
+echo "Write bios version."
+dd if=$BIOS of=$HPA bs=1 count=24 skip=$(expr $BIOS_SIZE - 24) seek=$(expr $HPA_LAST + 264) status=none
+
+while true
+do
+	echo "Last chance are you sure? (y/n)"
+	read SURE
+	if [ -z $SURE ];
+	then
+		continue;
+	fi
+
+	if [ $SURE = 'y' ];
+	then
+		break;
+	fi
+
+	if [ $SURE = 'n' ];
+	then
+		exit;
+	fi
+done
+echo "Erase space for HPA..."
+dd if=/dev/zero of=$DEV bs=$SECTOR_SIZE seek=$(expr $HPA_START - 8) status=none
+
+echo "Creating HPA, writing changes..."
+
+sudo dd if=$HPA of=$DEV bs=$SECTOR_SIZE seek=$HPA_START status=none
+
+sudo hdparm --yes-i-know-what-i-am-doing -Np$HPA_START $DEV
+sync
+
+echo "Done."
